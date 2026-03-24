@@ -20,11 +20,11 @@ def get_adb_stat(cmd_args):
 def get_device_health():
     """Returns a dictionary of current thermal, cpu, and screen status."""
     # Thermal (macOS / Linux uses grep instead of findstr)
-    temp_raw = get_adb_stat(["shell", "dumpsys", "battery", "|", "grep", "temperature"])
+    temp_raw = get_adb_stat(["shell", '"dumpsys battery | grep temperature"'])
     # CPU (Top 1 line)
-    cpu = get_adb_stat(["shell", "top", "-n", "1", "-m", "1", "|", "grep", "%"])
+    cpu = get_adb_stat(["shell", '"top -n 1 -m 1 | grep %"'])
     # Screen Status
-    screen = get_adb_stat(["shell", "dumpsys", "display", "|", "grep", "mScreenState"])
+    screen = get_adb_stat(["shell", '"dumpsys display | grep mScreenState"'])
 
     temp_val = temp_raw.split()[-1] if temp_raw else "0"
 
@@ -37,6 +37,7 @@ def get_device_health():
 @mcp.tool()
 def get_device_fps(package_name: str):
     """Returns the total frames rendered and janky frames for a specific package to calculate FPS/stutter."""
+    package_name = package_name.strip()
     raw = get_adb_stat(["shell", "dumpsys", "gfxinfo", package_name])
     janky = re.search(r"Janky frames: (\d+)", raw)
     total = re.search(r"Total frames rendered: (\d+)", raw)
