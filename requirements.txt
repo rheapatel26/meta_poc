@@ -2,3 +2,5 @@ streamlit
 pandas
 plotly
 pure-python-adb
+mcp
+adbutils
