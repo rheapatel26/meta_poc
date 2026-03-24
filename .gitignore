@@ -1,0 +1,7 @@
+.env
+__pycache__/
+*.pyc
+*.perfetto-trace
+*.log
+.vscode/
+sf_layers.txt

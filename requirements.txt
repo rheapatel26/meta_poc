@@ -4,3 +4,5 @@ plotly
 pure-python-adb
 mcp
 adbutils
+python-dotenv
+openai
