@@ -159,7 +159,7 @@ def parse_perfetto_trace(trace_path, pkg):
                 SELECT 
                   COALESCE(layer_name, 'None') as layer_name,
                   COUNT(*) as c,
-                  SUM(CASE WHEN layer_name LIKE '%{short_pkg}%' THEN 1000 ELSE 0 END) as priority_score
+                  SUM(CASE WHEN layer_name LIKE '%{pkg}%' OR layer_name LIKE '%{short_pkg}%' THEN 1000 ELSE 0 END) as priority_score
                 FROM actual_frame_timeline_slice
                 WHERE present_type = 'PRESENTED'
                   AND (
@@ -224,7 +224,7 @@ def parse_perfetto_trace(trace_path, pkg):
               JOIN thread_track tt ON s.track_id = tt.id
               JOIN thread t        ON tt.utid = t.utid
               JOIN process p       ON t.upid = p.upid
-              WHERE p.name LIKE '%{short_pkg}%'
+              WHERE (p.name LIKE '%{pkg}%' OR p.name LIKE '%{short_pkg}%')
                 AND (s.name LIKE 'eglSwapBuffers%' OR s.name LIKE 'vkQueuePresentKHR%')
                 AND s.dur > 0
             ),
@@ -251,7 +251,7 @@ def parse_perfetto_trace(trace_path, pkg):
                   JOIN thread_track tt ON s.track_id = tt.id
                   JOIN thread t        ON tt.utid = t.utid
                   JOIN process p       ON t.upid = p.upid
-                  WHERE p.name LIKE '%{short_pkg}%'
+                  WHERE (p.name LIKE '%{pkg}%' OR p.name LIKE '%{short_pkg}%')
                     AND s.name = 'Choreographer#doFrame'
                     AND s.dur > 0
                 ),
@@ -286,7 +286,7 @@ def parse_perfetto_trace(trace_path, pkg):
               JOIN thread_track ON slice.track_id = thread_track.id
               JOIN thread USING(utid)
               JOIN process USING(upid)
-              WHERE process.name LIKE '%{short_pkg}%'
+              WHERE (process.name LIKE '%{pkg}%' OR process.name LIKE '%{short_pkg}%')
                 AND dur > 1000000
             ),
             min_ts AS (SELECT MIN(ts) as start_ts FROM gpu_slices),
@@ -622,7 +622,7 @@ st.set_page_config(page_title="Android Game Profiler", layout="wide")
 st.title("🎮 Android Game Profiler")
 st.caption("LnT × Meta Internship Tool | Live Monitor + Perfetto Session Recorder + AI Chat")
 
-defaults = {"running": False, "data": [], "pkg": "jp.konami.pesam", "log_path": None, "live_history": [], "chat_messages": [], "perfetto_data": None}
+defaults = {"running": False, "data": [], "pkg": "", "log_path": None, "live_history": [], "chat_messages": [], "perfetto_data": None}
 for key, default in defaults.items():
     if key not in st.session_state:
         st.session_state[key] = default
@@ -631,6 +631,16 @@ with st.sidebar:
     st.header("⚙️ Configuration")
     mode = st.radio("📌 Select Mode", ["📡 Real-Time Monitor", "🎬 Perfetto Session Recorder", "🤖 AI Chat (MCP)"], index=0)
     st.divider()
+    
+    # Auto-detect foreground app button
+    if st.button("🎯 Auto-Detect Running Game", use_container_width=True):
+        detected_pkg = get_foreground_pkg()
+        if detected_pkg:
+            st.session_state.pkg = detected_pkg
+            st.success(f"Detected: {detected_pkg}")
+        else:
+            st.error("Could not detect foreground app")
+            
     pkg = st.text_input("Package name", value=st.session_state.pkg)
     st.session_state.pkg = pkg
     target_fps = st.selectbox("🎯 Exact Game FPS (Target/Vsync)", [30, 45, 60, 90, 120, 144], index=2, help="Change this instantly to evaluate exact jank limits based on the game's actual FPS max.")
