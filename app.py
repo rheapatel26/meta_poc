@@ -339,47 +339,61 @@ def get_fps_mcp(package_name):
     
     # Method 1: dumpsys gfxinfo (works for native UI and some engines)
     adb(f"dumpsys gfxinfo {package_name} reset")
+    
+    t0 = time.time()
     time.sleep(1.5)
+    elapsed = time.time() - t0
+    
     raw = adb(f"dumpsys gfxinfo {package_name}")
     janky = re.search(r"Janky frames: (\d+)", raw)
     total = re.search(r"Total frames rendered: (\d+)", raw)
     
     janky_frames = int(janky.group(1)) if janky else 0
     total_frames = int(total.group(1)) if total else 0
+    estimated_fps = 0.0
+    
+    if total_frames > 0:
+        estimated_fps = round(total_frames / elapsed, 1)
     
     # Method 2: Fallback to atrace if gfxinfo returns 0 (Unreal/Unity games)
     if total_frames == 0:
         try:
-            # Capture 1.5s of gfx trace
-            adb("atrace --async_start -c gfx view")
+            # Capture gfx trace with 16MB buffer to prevent overwrite at 120+ FPS
+            adb("atrace --async_start -b 16384 -c gfx view")
+            
+            t1 = time.time()
             time.sleep(1.5)
+            
             trace_raw = adb("atrace --async_dump -c gfx")
             adb("atrace --async_stop")
+            
+            elapsed_atrace = time.time() - t1
+            if elapsed_atrace <= 0: elapsed_atrace = 1.5
             
             # Count render events indicating frames
             swap_count = trace_raw.count("eglSwapBuffers")
             queue_count = trace_raw.count("queueBuffer")
             do_frame_count = trace_raw.count("doFrame")
             
-            # UE4/Unity use different render paths; queueBuffer is often 2-3x per frame, 
-            # doFrame is UI thread, eglSwapBuffers is render thread.
-            # A robust fallback estimate:
+            # UE4/Unity use different render paths
             if swap_count > 5:
                 total_frames = swap_count
             elif do_frame_count > 5:
                 total_frames = do_frame_count
             elif queue_count > 5:
-                total_frames = int(queue_count / 2) # Usually 2-3 buffers queued per frame
+                # `queueBuffer` is often called multiple times per final frame
+                # Typical is ~2.2x queueBuffer per eglSwap on CoD
+                total_frames = int(queue_count / 2)
             
-            # Since this is over 1.5 seconds, we don't have exact jank %, but 
-            # we at least have a valid frames rendered count for the interval.
+            if total_frames > 0:
+                estimated_fps = round(total_frames / elapsed_atrace, 1)
         except Exception:
             pass
 
     return {
         "janky_frames": janky_frames,
-        "total_frames_1_5s": total_frames,  # Provide context it's a 1.5s window
-        "estimated_fps_hz": round(total_frames / 1.5, 1) if total_frames > 0 else 0
+        "total_frames_1_5s": total_frames, 
+        "estimated_fps_hz": estimated_fps
     }
 
 def get_gpu_info():
