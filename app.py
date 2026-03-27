@@ -97,8 +97,14 @@ def collect_snapshot(pkg, ts):
 # ─── Perfetto Tracing Helpers ─────────────────────────────────
 def run_perfetto_trace(pkg, duration_sec):
     config = f"""
-buffers {{ size_kb: 126976 fill_policy: RING_BUFFER }}
+buffers {{
+    size_kb: 65536
+    fill_policy: RING_BUFFER
+}}
+write_into_file: true
+file_write_period_ms: 2500
 data_sources {{ config {{ name: "android.surfaceflinger.frametimeline" }} }}
+data_sources {{ config {{ name: "android.surfaceflinger" }} }}
 data_sources {{ config {{ name: "linux.ftrace"
         ftrace_config {{
             ftrace_events: "ftrace/print"
@@ -126,11 +132,12 @@ duration_ms: {duration_sec * 1000}
     subprocess.run("adb push perfetto_config.pbtx /data/local/tmp/perfetto_config.pbtx", shell=True)
     subprocess.run("adb shell \"cat /data/local/tmp/perfetto_config.pbtx | perfetto --txt -c - -o /data/misc/perfetto-traces/trace.perfetto-trace\"", shell=True)
     
+    time.sleep(2.0) # Wait for flush
     trace_path = f"trace_{pkg}_{int(time.time())}.perfetto-trace"
     subprocess.run(f"adb pull /data/misc/perfetto-traces/trace.perfetto-trace {trace_path}", shell=True)
     return trace_path
 
-def parse_perfetto_trace(trace_path, pkg):
+def parse_perfetto_trace(trace_path, pkg, target_fps=60):
     try:
         tp = TraceProcessor(trace=trace_path)
     except Exception as e:
@@ -293,16 +300,26 @@ def parse_perfetto_trace(trace_path, pkg):
             bucketed AS (
               SELECT
                 CAST((ts-(SELECT start_ts FROM min_ts))/1e9 AS INT) AS time_s,
+                CAST((ts-(SELECT start_ts FROM min_ts))/16666666 AS INT) AS vsync_window,
                 ts/1e6  AS ts_ms,
                 dur/1e6 AS dur_ms,
                 0 AS is_jank
               FROM gpu_slices
+            ),
+            unique_frames AS (
+              SELECT time_s, vsync_window, MIN(ts_ms) as ts_ms, MAX(dur_ms) as dur_ms, MAX(is_jank) as is_jank
+              FROM bucketed
+              GROUP BY time_s, vsync_window
             )
             SELECT time_s, ts_ms, dur_ms, is_jank,
               COUNT(*) OVER (PARTITION BY time_s) AS fps_at_sec
-            FROM bucketed ORDER BY ts_ms
+            FROM unique_frames ORDER BY ts_ms
             """
             df_results = tp.query(query).as_pandas_dataframe()
+            
+            # Apply hard clamp to target_fps + 5% variance for fallback estimation
+            if not df_results.empty:
+                 df_results['fps_at_sec'] = df_results['fps_at_sec'].clip(upper=int(target_fps * 1.05))
             method_used = "gpu_slices_fallback"
         except Exception as e:
             print(f"GPU slice fallback failed: {e}")
@@ -350,6 +367,7 @@ def get_fps_mcp(package_name):
     
     janky_frames = int(janky.group(1)) if janky else 0
     total_frames = int(total.group(1)) if total else 0
+    total_frames_from_gfx = total_frames
     estimated_fps = 0.0
     
     if total_frames > 0:
@@ -392,8 +410,9 @@ def get_fps_mcp(package_name):
 
     return {
         "janky_frames": janky_frames,
-        "total_frames_1_5s": total_frames, 
-        "estimated_fps_hz": estimated_fps
+        "total_frames_measured": total_frames, 
+        "estimated_fps_hz": estimated_fps,
+        "elapsed_seconds": round(elapsed_atrace if total_frames_from_gfx == 0 else elapsed, 2)
     }
 
 def get_gpu_info():
@@ -719,7 +738,7 @@ elif mode == "🎬 Perfetto Session Recorder":
         # 1. Start Perfetto as a background process so we don't need Streamlit threads
         with st.spinner(f"🎥 Recording deeply on instrumented native graphics for {duration} seconds..."):
             with open("perfetto_config.pbtx", "w") as f:
-                config = f'''buffers {{ size_kb: 126976 fill_policy: RING_BUFFER }} data_sources {{ config {{ name: "android.surfaceflinger.frametimeline" }} }} data_sources {{ config {{ name: "linux.ftrace" ftrace_config {{ ftrace_events: "ftrace/print" ftrace_events: "power/cpu_frequency" ftrace_events: "power/cpu_idle" atrace_categories: "gfx" atrace_categories: "view" atrace_categories: "wm" atrace_categories: "sched" atrace_categories: "freq" atrace_categories: "rs" atrace_categories: "am" atrace_apps: "{pkg}" atrace_apps: "*" }} }} }} data_sources {{ config {{ name: "linux.process_stats" process_stats_config {{ scan_all_processes_on_start: true proc_stats_poll_ms: 1000 }} }} }} duration_ms: {duration * 1000}'''
+                config = f'''buffers {{ size_kb: 65536 fill_policy: RING_BUFFER }} write_into_file: true file_write_period_ms: 2500 data_sources {{ config {{ name: "android.surfaceflinger.frametimeline" }} }} data_sources {{ config {{ name: "android.surfaceflinger" }} }} data_sources {{ config {{ name: "linux.ftrace" ftrace_config {{ ftrace_events: "ftrace/print" ftrace_events: "power/cpu_frequency" ftrace_events: "power/cpu_idle" atrace_categories: "gfx" atrace_categories: "view" atrace_categories: "wm" atrace_categories: "sched" atrace_categories: "freq" atrace_categories: "rs" atrace_categories: "am" atrace_apps: "{pkg}" atrace_apps: "*" }} }} }} data_sources {{ config {{ name: "linux.process_stats" process_stats_config {{ scan_all_processes_on_start: true proc_stats_poll_ms: 1000 }} }} }} duration_ms: {duration * 1000}'''
                 f.write(config)
             subprocess.run("adb push perfetto_config.pbtx /data/local/tmp/perfetto_config.pbtx", shell=True)
             
@@ -746,6 +765,9 @@ elif mode == "🎬 Perfetto Session Recorder":
             # Get final gfxinfo stats
             st.session_state["gfx_summary"] = get_fps_mcp(pkg)
             
+            # Give device an extra 2 seconds to flush trace to disk natively before pulling
+            time.sleep(2.0)
+            
             # Pull trace
             trace_file = f"trace_{pkg}_{int(time.time())}.perfetto-trace"
             subprocess.run(f"adb pull /data/misc/perfetto-traces/trace.perfetto-trace {trace_file}", shell=True)
@@ -755,7 +777,7 @@ elif mode == "🎬 Perfetto Session Recorder":
         st.session_state.data = adb_results
         
         with st.spinner("🧠 Booting Perfetto SQL Trace Processor & Dissecting Trace..."):
-            perfetto_df, method_used = parse_perfetto_trace(trace_file, pkg)
+            perfetto_df, method_used = parse_perfetto_trace(trace_file, pkg, target_fps)
             st.session_state["trace_method"] = method_used
             
             if not perfetto_df.empty:
