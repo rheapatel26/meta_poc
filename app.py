@@ -13,626 +13,10 @@ from perfetto.trace_processor import TraceProcessor
 # Load environment variables
 load_dotenv()
 
-# ─── ADB helpers ──────────────────────────────────────────────
-def adb(cmd):
-    try:
-        result = subprocess.run(
-            f"adb shell {cmd}", shell=True,
-            capture_output=True, text=True, timeout=5
-        )
-        return result.stdout
-    except Exception:
-        return ""
-
-def get_battery():
-    raw = adb("dumpsys battery")
-    level = re.search(r"level: (\d+)", raw)
-    temp  = re.search(r"temperature: (\d+)", raw)
-    volt  = re.search(r"voltage: (\d+)", raw)
-    return {
-        "battery_pct":  int(level.group(1)) if level else None,
-        "battery_temp": int(temp.group(1)) / 10 if temp else None,
-        "battery_volt": int(volt.group(1)) / 1000 if volt else None,
-    }
-
-def get_memory(pkg):
-    raw = adb(f"dumpsys meminfo {pkg}")
-    pss = re.search(r"TOTAL PSS:\s+(\d+)", raw)
-    rss = re.search(r"TOTAL RSS:\s+(\d+)", raw)
-    return {
-        "mem_pss_mb": int(pss.group(1)) / 1024 if pss else None,
-        "mem_rss_mb": int(rss.group(1)) / 1024 if rss else None,
-    }
-
-def get_cpu(pkg):
-    raw = adb("dumpsys cpuinfo")
-    match = re.search(rf"([\d.]+)% .+{re.escape(pkg)}", raw)
-    return {"cpu_pct": float(match.group(1)) if match else 0.0}
-
-def get_thermals():
-    raw = adb('"cat /sys/class/thermal/thermal_zone*/temp 2>/dev/null"')
-    temps = [int(t)/1000 for t in raw.split() if t.isdigit() and int(t) < 200000]
-    return {"max_thermal_c": max(temps) if temps else None}
-
-def get_foreground_pkg():
-    """Detect foreground package using multiple ADB methods for reliability."""
-    # Method 1: dumpsys window mCurrentFocus (most reliable across Android versions)
-    # Format: "mCurrentFocus=Window{hash u0 pkg/activity}"
-    try:
-        raw = subprocess.run(
-            "adb shell dumpsys window", shell=True,
-            capture_output=True, text=True, timeout=8
-        ).stdout
-        for line in raw.splitlines():
-            if "mCurrentFocus" in line:
-                # Match pattern: u0 <package>/ or just <package>/
-                m = re.search(r"u0\s+([\w.]+)/", line)
-                if m:
-                    return m.group(1)
-                # Some devices use format without u0
-                m2 = re.search(r"\s([\w.]+)/[\w.]+\}", line)
-                if m2:
-                    return m2.group(1)
-            if "mFocusedApp" in line:
-                m = re.search(r"u0\s+([\w.]+)/", line)
-                if m:
-                    return m.group(1)
-    except Exception:
-        pass
-    
-    # Method 2: Fallback to mResumedActivity
-    raw2 = adb('"dumpsys activity | grep mResumedActivity"')
-    match = re.search(r"u0 ([\w.]+)/", raw2)
-    return match.group(1) if match else None
-
-def collect_snapshot(pkg, ts):
-    # Standard lightweight ADB polling (CPU/RAM/Temp)
-    row = {"timestamp": ts}
-    row.update(get_battery())
-    row.update(get_memory(pkg))
-    row.update(get_cpu(pkg))
-    row.update(get_thermals())
-    return row
-
-# ─── Perfetto Tracing Helpers ─────────────────────────────────
-def run_perfetto_trace(pkg, duration_sec):
-    config = f"""
-buffers {{
-    size_kb: 65536
-    fill_policy: RING_BUFFER
-}}
-write_into_file: true
-file_write_period_ms: 2500
-data_sources {{ config {{ name: "android.surfaceflinger.frametimeline" }} }}
-data_sources {{ config {{ name: "android.surfaceflinger" }} }}
-data_sources {{ config {{ name: "linux.ftrace"
-        ftrace_config {{
-            ftrace_events: "ftrace/print"
-            ftrace_events: "power/cpu_frequency"
-            ftrace_events: "power/cpu_idle"
-            atrace_categories: "gfx"
-            atrace_categories: "view"
-            atrace_categories: "wm"
-            atrace_categories: "sched"
-            atrace_categories: "freq"
-            atrace_categories: "rs"
-            atrace_categories: "am"
-            atrace_apps: "{pkg}"
-            atrace_apps: "*"
-        }}
-    }} }}
-data_sources {{ config {{ name: "linux.process_stats"
-        process_stats_config {{ scan_all_processes_on_start: true proc_stats_poll_ms: 1000 }}
-    }} }}
-duration_ms: {duration_sec * 1000}
-"""
-    with open("perfetto_config.pbtx", "w") as f:
-        f.write(config)
-    
-    subprocess.run("adb push perfetto_config.pbtx /data/local/tmp/perfetto_config.pbtx", shell=True)
-    subprocess.run("adb shell \"cat /data/local/tmp/perfetto_config.pbtx | perfetto --txt -c - -o /data/misc/perfetto-traces/trace.perfetto-trace\"", shell=True)
-    
-    time.sleep(2.0) # Wait for flush
-    trace_path = f"trace_{pkg}_{int(time.time())}.perfetto-trace"
-    subprocess.run(f"adb pull /data/misc/perfetto-traces/trace.perfetto-trace {trace_path}", shell=True)
-    return trace_path
-
-def parse_perfetto_trace(trace_path, pkg, target_fps=60):
-    try:
-        tp = TraceProcessor(trace=trace_path)
-    except Exception as e:
-        st.error(f"Failed to initialize trace processor: {e}")
-        return pd.DataFrame(), "init_error"
-
-    # ── Step 1: Check if frametimeline data exists at all ──
-    try:
-        count_row = tp.query(
-            "SELECT COUNT(*) as c FROM actual_frame_timeline_slice"
-        ).as_pandas_dataframe()
-        has_frametimeline = count_row.iloc[0]['c'] > 0
-    except Exception:
-        has_frametimeline = False
-
-    df_results = pd.DataFrame()
-    method_used = "none"
-
-    # ── Step 2A: Preferred — SurfaceFlinger FrameTimeline ──
-    if has_frametimeline:
-        try:
-            # Find dominant game layer automatically
-            # Handle Unity 'None' layers (NULL in SQL)
-            short_pkg = pkg.split('.')[-1]
-            layer_df = tp.query(f"""
-                SELECT 
-                  COALESCE(layer_name, 'None') as layer_name,
-                  COUNT(*) as c,
-                  SUM(CASE WHEN layer_name LIKE '%{pkg}%' OR layer_name LIKE '%{short_pkg}%' THEN 1000 ELSE 0 END) as priority_score
-                FROM actual_frame_timeline_slice
-                WHERE present_type = 'PRESENTED'
-                  AND (
-                    layer_name IS NULL
-                    OR (
-                      layer_name NOT LIKE '%StatusBar%'
-                      AND layer_name NOT LIKE '%NavigationBar%'
-                      AND layer_name NOT LIKE '%TaskBar%'
-                      AND layer_name NOT LIKE '%InputMethod%'
-                      AND layer_name NOT LIKE '%Snapshot%'
-                      AND layer_name NOT LIKE '%Wallpaper%'
-                    )
-                  )
-                GROUP BY layer_name
-                ORDER BY priority_score DESC, c DESC
-                LIMIT 1
-            """).as_pandas_dataframe()
-
-            if not layer_df.empty:
-                dominant = layer_df.iloc[0]['layer_name']
-                if dominant == "None":
-                    layer_filter = "layer_name IS NULL"
-                else:
-                    escaped_dominant = dominant.replace("'", "''")
-                    layer_filter = f"layer_name = '{escaped_dominant}'"
-                
-                query = f"""
-                WITH app_frames AS (
-                  SELECT ts, dur
-                  FROM actual_frame_timeline_slice
-                  WHERE present_type = 'PRESENTED'
-                    AND {layer_filter}
-                ),
-                min_ts AS (SELECT MIN(ts) as start_ts FROM app_frames),
-                bucketed AS (
-                  SELECT
-                    CAST((ts-(SELECT start_ts FROM min_ts))/1e9 AS INT) AS time_s,
-                    ts/1e6  AS ts_ms,
-                    dur/1e6 AS dur_ms,
-                    0 AS is_jank
-                  FROM app_frames
-                )
-                SELECT
-                  time_s, ts_ms, dur_ms, is_jank,
-                  COUNT(*) OVER (PARTITION BY time_s) AS fps_at_sec
-                FROM bucketed ORDER BY ts_ms
-                """
-                df_results = tp.query(query).as_pandas_dataframe()
-                method_used = f"frametimeline:{dominant[:40]}"
-        except Exception as e:
-            print(f"FrameTimeline query failed: {e}")
-
-    # ── Step 2B: Fallback — eglSwapBuffers (True Render Ticks) ──
-    if df_results.empty:
-        try:
-            short_pkg = pkg.split('.')[-1]
-            # Use eglSwapBuffers% which is 1:1 with pure engine render ticks, avoiding UI thread buffer bloat.
-            query = f"""
-            WITH app_slices AS (
-              SELECT s.ts, s.dur
-              FROM slice s
-              JOIN thread_track tt ON s.track_id = tt.id
-              JOIN thread t        ON tt.utid = t.utid
-              JOIN process p       ON t.upid = p.upid
-              WHERE (p.name LIKE '%{pkg}%' OR p.name LIKE '%{short_pkg}%')
-                AND (s.name LIKE 'eglSwapBuffers%' OR s.name LIKE 'vkQueuePresentKHR%')
-                AND s.dur > 0
-            ),
-            min_ts AS (SELECT MIN(ts) as start_ts FROM app_slices),
-            bucketed AS (
-              SELECT
-                CAST((ts-(SELECT start_ts FROM min_ts))/1e9 AS INT) AS time_s,
-                ts/1e6  AS ts_ms,
-                dur/1e6 AS dur_ms,
-                0 AS is_jank
-              FROM app_slices
-            )
-            SELECT time_s, ts_ms, dur_ms, is_jank,
-              COUNT(*) OVER (PARTITION BY time_s) AS fps_at_sec
-            FROM bucketed ORDER BY ts_ms
-            """
-            df_results = tp.query(query).as_pandas_dataframe()
-            # If queueBuffer gave nothing, try Choreographer#doFrame (exactly 1 per VSYNC)
-            if df_results.empty:
-                query2 = f"""
-                WITH app_slices AS (
-                  SELECT s.ts, s.dur
-                  FROM slice s
-                  JOIN thread_track tt ON s.track_id = tt.id
-                  JOIN thread t        ON tt.utid = t.utid
-                  JOIN process p       ON t.upid = p.upid
-                  WHERE (p.name LIKE '%{pkg}%' OR p.name LIKE '%{short_pkg}%')
-                    AND s.name = 'Choreographer#doFrame'
-                    AND s.dur > 0
-                ),
-                min_ts AS (SELECT MIN(ts) as start_ts FROM app_slices),
-                bucketed AS (
-                  SELECT
-                    CAST((ts-(SELECT start_ts FROM min_ts))/1e9 AS INT) AS time_s,
-                    ts/1e6  AS ts_ms,
-                    dur/1e6 AS dur_ms,
-                    0 AS is_jank
-                  FROM app_slices
-                )
-                SELECT time_s, ts_ms, dur_ms, is_jank,
-                  COUNT(*) OVER (PARTITION BY time_s) AS fps_at_sec
-                FROM bucketed ORDER BY ts_ms
-                """
-                df_results = tp.query(query2).as_pandas_dataframe()
-                method_used = "atrace:Choreographer"
-            else:
-                method_used = "atrace:eglSwapBuffers"
-        except Exception as e:
-            print(f"atrace fallback failed: {e}")
-
-    # ── Step 2C: Last resort — count any GPU work slices ──
-    if df_results.empty:
-        try:
-            short_pkg = pkg.split('.')[-1]
-            query = f"""
-            WITH gpu_slices AS (
-              SELECT ts, dur
-              FROM slice
-              JOIN thread_track ON slice.track_id = thread_track.id
-              JOIN thread USING(utid)
-              JOIN process USING(upid)
-              WHERE (process.name LIKE '%{pkg}%' OR process.name LIKE '%{short_pkg}%')
-                AND dur > 1000000
-            ),
-            min_ts AS (SELECT MIN(ts) as start_ts FROM gpu_slices),
-            bucketed AS (
-              SELECT
-                CAST((ts-(SELECT start_ts FROM min_ts))/1e9 AS INT) AS time_s,
-                CAST((ts-(SELECT start_ts FROM min_ts))/16666666 AS INT) AS vsync_window,
-                ts/1e6  AS ts_ms,
-                dur/1e6 AS dur_ms,
-                0 AS is_jank
-              FROM gpu_slices
-            ),
-            unique_frames AS (
-              SELECT time_s, vsync_window, MIN(ts_ms) as ts_ms, MAX(dur_ms) as dur_ms, MAX(is_jank) as is_jank
-              FROM bucketed
-              GROUP BY time_s, vsync_window
-            )
-            SELECT time_s, ts_ms, dur_ms, is_jank,
-              COUNT(*) OVER (PARTITION BY time_s) AS fps_at_sec
-            FROM unique_frames ORDER BY ts_ms
-            """
-            df_results = tp.query(query).as_pandas_dataframe()
-            
-            # Apply hard clamp to target_fps + 5% variance for fallback estimation
-            if not df_results.empty:
-                 df_results['fps_at_sec'] = df_results['fps_at_sec'].clip(upper=int(target_fps * 1.05))
-            method_used = "gpu_slices_fallback"
-        except Exception as e:
-            print(f"GPU slice fallback failed: {e}")
-
-    tp.close()
-    return df_results, method_used
-
-# ─── MCP-style AI Tool Router ────────────────────────────────
-def get_device_health():
-    temp_raw = adb('"dumpsys battery | grep temperature"')
-    cpu_raw = adb('"top -n 1 -m 1 | grep %"')
-    screen_raw = adb('"dumpsys display | grep mScreenState"')
-    temp_val = temp_raw.split()[-1] if temp_raw.strip() else "0"
-    return {
-        "temp": f"{int(temp_val)/10}°C" if temp_val.isdigit() else "N/A",
-        "cpu": cpu_raw.strip()[:80] if cpu_raw.strip() else "Idle",
-        "status": "Active" if "ON" in screen_raw.upper() else "Frozen/Off"
-    }
-
-def get_cpu_mcp(package_name):
-    return get_cpu(package_name)
-
-def get_memory_mcp(package_name):
-    return get_memory(package_name)
-
-def get_battery_mcp():
-    return get_battery()
-
-def get_thermal_mcp():
-    return get_thermals()
-
-def get_fps_mcp(package_name):
-    package_name = package_name.strip()
-    
-    # Method 1: dumpsys gfxinfo (works for native UI and some engines)
-    adb(f"dumpsys gfxinfo {package_name} reset")
-    
-    t0 = time.time()
-    time.sleep(1.5)
-    elapsed = time.time() - t0
-    
-    raw = adb(f"dumpsys gfxinfo {package_name}")
-    janky = re.search(r"Janky frames: (\d+)", raw)
-    total = re.search(r"Total frames rendered: (\d+)", raw)
-    
-    janky_frames = int(janky.group(1)) if janky else 0
-    total_frames = int(total.group(1)) if total else 0
-    total_frames_from_gfx = total_frames
-    estimated_fps = 0.0
-    
-    if total_frames > 0:
-        estimated_fps = round(total_frames / elapsed, 1)
-    
-    # Method 2: Fallback to atrace if gfxinfo returns 0 (Unreal/Unity games)
-    if total_frames == 0:
-        try:
-            # Capture gfx trace with 16MB buffer to prevent overwrite at 120+ FPS
-            adb("atrace --async_start -b 16384 -c gfx view")
-            
-            t1 = time.time()
-            time.sleep(1.5)
-            
-            trace_raw = adb("atrace --async_dump -c gfx")
-            adb("atrace --async_stop")
-            
-            elapsed_atrace = time.time() - t1
-            if elapsed_atrace <= 0: elapsed_atrace = 1.5
-            
-            # Count render events indicating frames
-            swap_count = trace_raw.count("eglSwapBuffers")
-            queue_count = trace_raw.count("queueBuffer")
-            do_frame_count = trace_raw.count("doFrame")
-            
-            # UE4/Unity use different render paths
-            if swap_count > 5:
-                total_frames = swap_count
-            elif do_frame_count > 5:
-                total_frames = do_frame_count
-            elif queue_count > 5:
-                # `queueBuffer` is often called multiple times per final frame
-                # Typical is ~2.2x queueBuffer per eglSwap on CoD
-                total_frames = int(queue_count / 2)
-            
-            if total_frames > 0:
-                estimated_fps = round(total_frames / elapsed_atrace, 1)
-        except Exception:
-            pass
-
-    return {
-        "janky_frames": janky_frames,
-        "total_frames_measured": total_frames, 
-        "estimated_fps_hz": estimated_fps,
-        "elapsed_seconds": round(elapsed_atrace if total_frames_from_gfx == 0 else elapsed, 2)
-    }
-
-def get_gpu_info():
-    """Pull real-time GPU frequency and load from Android sysfs/dumpsys."""
-    gpu_freq = adb('"cat /sys/class/kgsl/kgsl-3d0/gpuclk 2>/dev/null || cat /sys/kernel/gpu/gpu_clock 2>/dev/null || echo N/A"')
-    gpu_busy = adb('"cat /sys/class/kgsl/kgsl-3d0/gpubusy 2>/dev/null || echo N/A"')
-    gpu_governor = adb('"cat /sys/class/kgsl/kgsl-3d0/devfreq/governor 2>/dev/null || echo N/A"')
-    return {
-        "gpu_clock_hz": gpu_freq.strip(),
-        "gpu_busy": gpu_busy.strip(),
-        "gpu_governor": gpu_governor.strip(),
-    }
-
-def get_network_stats():
-    """Get live network connectivity and data usage stats."""
-    wifi_raw = adb('"dumpsys wifi | grep mWifiInfo"')
-    net_stats = adb('"cat /proc/net/dev"')
-    connectivity = adb('"dumpsys connectivity | grep NetworkAgentInfo"')
-    # Parse active network type
-    net_type = "Unknown"
-    if "WIFI" in connectivity.upper():
-        net_type = "WiFi"
-    elif "MOBILE" in connectivity.upper() or "CELLULAR" in connectivity.upper():
-        net_type = "Cellular"
-    # Parse WiFi signal
-    rssi_match = re.search(r"RSSI: (-?\d+)", wifi_raw)
-    link_speed_match = re.search(r"Link speed: (\d+)", wifi_raw)
-    return {
-        "network_type": net_type,
-        "wifi_rssi_dbm": int(rssi_match.group(1)) if rssi_match else None,
-        "wifi_link_speed_mbps": int(link_speed_match.group(1)) if link_speed_match else None,
-    }
-
-def get_running_processes(package_name):
-    """Get top running processes and check game foreground/background state."""
-    top_raw = adb('"top -n 1 -m 10 -b"')
-    proc_lines = []
-    for line in top_raw.strip().splitlines():
-        if '%' in line and not line.startswith('Mem') and not line.startswith('Tasks'):
-            proc_lines.append(line.strip()[:120])
-    fg_pkg = get_foreground_pkg()
-    return {
-        "foreground_app": fg_pkg,
-        "game_is_foreground": fg_pkg == package_name if fg_pkg else False,
-        "top_processes": proc_lines[:8],
-    }
-
-def get_display_info():
-    """Get screen resolution, density, and refresh rate."""
-    wm_size = adb('"wm size"')
-    wm_density = adb('"wm density"')
-    refresh_raw = adb('"dumpsys display | grep mRefreshRate"')
-    brightness_raw = adb('"settings get system screen_brightness"')
-    size_match = re.search(r"(\d+x\d+)", wm_size)
-    density_match = re.search(r"(\d+)", wm_density)
-    refresh_match = re.search(r"([\d.]+)", refresh_raw)
-    return {
-        "resolution": size_match.group(1) if size_match else "N/A",
-        "density_dpi": int(density_match.group(1)) if density_match else None,
-        "refresh_rate_hz": float(refresh_match.group(1)) if refresh_match else None,
-        "brightness": brightness_raw.strip() if brightness_raw.strip() else "N/A",
-    }
-
-def get_disk_io():
-    """Get disk I/O stats and available storage."""
-    storage_raw = adb('"df /data | tail -1"')
-    iostat_raw = adb('"cat /proc/diskstats | grep -E \"sda|mmcblk0\" | head -3"')
-    parts = storage_raw.split() if storage_raw.strip() else []
-    return {
-        "storage_total": parts[1] if len(parts) > 1 else "N/A",
-        "storage_used": parts[2] if len(parts) > 2 else "N/A",
-        "storage_available": parts[3] if len(parts) > 3 else "N/A",
-        "storage_use_pct": parts[4] if len(parts) > 4 else "N/A",
-        "disk_io_raw": iostat_raw.strip()[:200] if iostat_raw.strip() else "N/A",
-    }
-
-def get_top_apps():
-    """Get list of recently used / running applications."""
-    raw = adb('"dumpsys activity recents | grep realActivity"')
-    apps = re.findall(r"([\w.]+)/", raw)
-    # De-duplicate while preserving order
-    seen = set()
-    unique_apps = []
-    for a in apps:
-        if a not in seen:
-            seen.add(a)
-            unique_apps.append(a)
-    return {"recent_apps": unique_apps[:10]}
-
-def get_full_realtime_snapshot(package_name):
-    """MCP Master Tool: Pull ALL live data from Android in one shot for AI grounding."""
-    snapshot = {
-        "timestamp": datetime.now().isoformat(),
-        "foreground_app": get_foreground_pkg(),
-        "target_package": package_name,
-        "battery": get_battery(),
-        "cpu": get_cpu(package_name),
-        "memory": get_memory(package_name),
-        "thermals": get_thermals(),
-        "display": get_display_info(),
-        "gpu": get_gpu_info(),
-        "network": get_network_stats(),
-    }
-    snapshot["game_is_foreground"] = snapshot["foreground_app"] == package_name
-    return snapshot
-
-def analyze_performance_engine(package_name):
-    """AI Diagnosis Engine: Run full diagnostic and detect bottlenecks natively"""
-    data = collect_snapshot(package_name, datetime.now().isoformat())
-    current_pkg = get_foreground_pkg()
-    issues = []
-    status = "running"
-    
-    if current_pkg != package_name:
-        status = "not_running_or_background"
-        issues.append(f"Game is not in foreground (Current: {current_pkg})")
-    
-    if data.get("cpu_pct", 0) > 80: issues.append("High CPU usage")
-    if data.get("battery_temp") and data["battery_temp"] > 40: issues.append("Thermal throttling risk")
-    if data.get("mem_pss_mb", 0) > 3000: issues.append("High Memory usage (RAM bottleneck)")
-    
-    fps = get_fps_mcp(package_name)
-    if status == "running" and fps.get("janky_frames", 0) > 5:
-        issues.append("High frame drops (jank detected)")
-    
-    # Attach GPU and display for full context
-    gpu = get_gpu_info()
-    display = get_display_info()
-    network = get_network_stats()
-    
-    return {
-        "status": status,
-        "foreground_app": current_pkg,
-        "raw_snapshot": data,
-        "fps_data": fps,
-        "gpu": gpu,
-        "display": display,
-        "network": network,
-        "diagnosed_issues": issues if issues else ["No major bottlenecks detected. Device is running smoothly."]
-    }
-
-SYSTEM_PROMPT = """
-You are an expert Android Game Performance Analyst integrated into a real-time MCP (Model Context Protocol) diagnostic system.
-
-You are directly connected to a live Android device via ADB. Every query you receive includes a REAL-TIME DEVICE SNAPSHOT
-pulled from the actual device at the moment of the user's question. This is NOT simulated data — it is live telemetry.
-
-Your responsibilities:
-1. **Always reference the real-time data** — cite specific numbers (e.g., "Your CPU is at 72%", "Battery temp is 38.2°C").
-2. **Identify bottlenecks** — thermal throttling, memory pressure, GPU frequency drops, high CPU, jank frames.
-3. **Explain impact on gameplay** — connect metrics to user-visible effects (stutters, FPS drops, input lag).
-4. **Give actionable fixes** — concrete steps like "lower resolution", "close background apps", "enable battery saver".
-5. **Cross-correlate metrics** — e.g., high thermal + dropping GPU clock = thermal throttle causing FPS drops.
-6. **Report device state honestly** — if the game is not in the foreground, say so. If data is unavailable, note it.
-
-IMPORTANT: You are talking directly to the user who is playing a game on their Android phone.
-Be CONCISE, TECHNICAL, and always ground your analysis in the ACTUAL DATA provided.
-Do NOT make up data. Only analyze what the device snapshot provides.
-"""
-
-
-AVAILABLE_TOOLS = {
-    "get_cpu_usage":       {"function": lambda p: get_cpu_mcp(p),           "description": "Get current CPU % load for the game.",            "keywords": ["cpu", "load", "processor"]},
-    "get_memory_usage":    {"function": lambda p: get_memory_mcp(p),        "description": "Get RAM/Memory PSS usage.",                       "keywords": ["ram", "memory", "leak", "oom"]},
-    "get_fps":             {"function": lambda p: get_fps_mcp(p),           "description": "Get total frames and janky stutters.",            "keywords": ["fps", "jank", "stutter", "lag", "frames", "smooth", "framerate"]},
-    "get_thermal":         {"function": lambda _: get_thermal_mcp(),        "description": "Get max thermal zone temperature.",               "keywords": ["temp", "thermal", "overheating", "hot", "throttle", "heat"]},
-    "get_battery":         {"function": lambda _: get_battery_mcp(),        "description": "Get battery %, temperature, voltage.",            "keywords": ["battery", "power", "charge", "drain"]},
-    "get_gpu":             {"function": lambda _: get_gpu_info(),           "description": "Get GPU clock, busy %, and governor.",            "keywords": ["gpu", "graphics", "render", "adreno", "mali"]},
-    "get_network":         {"function": lambda _: get_network_stats(),      "description": "Get network type, WiFi signal, link speed.",      "keywords": ["network", "wifi", "ping", "signal", "internet", "latency", "connection"]},
-    "get_display":         {"function": lambda _: get_display_info(),       "description": "Get screen resolution, density, refresh rate.",   "keywords": ["display", "screen", "resolution", "refresh", "brightness"]},
-    "get_processes":       {"function": lambda p: get_running_processes(p), "description": "Get top processes and foreground app.",           "keywords": ["process", "running", "foreground", "background", "app", "kill"]},
-    "get_disk":            {"function": lambda _: get_disk_io(),            "description": "Get storage usage and disk I/O.",                "keywords": ["disk", "storage", "space", "io"]},
-    "get_top_apps":        {"function": lambda _: get_top_apps(),           "description": "Get recently used applications.",                "keywords": ["recent", "apps", "open", "switch"]},
-    "analyze_performance": {"function": lambda p: analyze_performance_engine(p), "description": "Run the AI Lag Diagnosis Engine to detect bottlenecks.", "keywords": ["diagnose", "analyze", "why", "lagging", "issue", "problem", "slow", "bad", "performance", "check", "report", "status"]}
-}
-
-def route_query(query, pkg):
-    query_lower = query.lower()
-    matched_tools = [name for name, info in AVAILABLE_TOOLS.items() if any(kw in query_lower for kw in info["keywords"])]
-    if not matched_tools: matched_tools = ["analyze_performance"]
-    
-    results = {}
-    for tool_name in matched_tools:
-        results[tool_name] = AVAILABLE_TOOLS[tool_name]["function"](pkg)
-    return results, matched_tools
-
-def format_ai_response(results, tools_called, live_snapshot=None):
-    """Format a rich fallback response when Groq is unavailable."""
-    analysis = results.get("analyze_performance", {})
-    status = analysis.get("status", "unknown")
-    foreground = analysis.get("foreground_app", "unknown")
-    
-    parts = [
-        "🤖 **Android Performance Analyst — Live Device Report**\n",
-        f"📱 Foreground App: `{foreground}`",
-        f"🎮 Game Status: **{status.upper()}**\n",
-    ]
-    
-    # Show live snapshot summary if available
-    if live_snapshot:
-        batt = live_snapshot.get('battery', {})
-        cpu = live_snapshot.get('cpu', {})
-        mem = live_snapshot.get('memory', {})
-        therm = live_snapshot.get('thermals', {})
-        disp = live_snapshot.get('display', {})
-        gpu = live_snapshot.get('gpu', {})
-        net = live_snapshot.get('network', {})
-        parts.append("**📊 Real-Time Device Snapshot:**")
-        parts.append(f"- 🔋 Battery: {batt.get('battery_pct', 'N/A')}% | Temp: {batt.get('battery_temp', 'N/A')}°C")
-        parts.append(f"- ⚡ CPU: {cpu.get('cpu_pct', 0):.1f}% | GPU Clock: {gpu.get('gpu_clock_hz', 'N/A')}")
-        parts.append(f"- 💾 RAM (PSS): {mem.get('mem_pss_mb', 0):.0f} MB")
-        parts.append(f"- 🌡️ Max Thermal: {therm.get('max_thermal_c', 'N/A')}°C")
-        parts.append(f"- 🖥️ Display: {disp.get('resolution', 'N/A')} @ {disp.get('refresh_rate_hz', 'N/A')} Hz")
-        parts.append(f"- 🌐 Network: {net.get('network_type', 'N/A')} | Signal: {net.get('wifi_rssi_dbm', 'N/A')} dBm\n")
-    
-    parts.append(f"*Tools executed:* `{'`, `'.join(tools_called)}`\n")
-    parts.append("---")
-    parts.append("*Raw Diagnostic Data:*")
-    parts.append(f"```json\n{json.dumps(results, indent=2)}\n```")
-    return "\n".join(parts)
+# ─── Internal Modules ───────────────────────────────────────────
+from adb_utils import adb, get_foreground_pkg, collect_snapshot, get_fps_stats
+from perfetto_utils import run_perfetto_trace, parse_perfetto_trace
+from ai_agent import get_full_realtime_snapshot, route_query, format_ai_response, SYSTEM_PROMPT
 
 # ═══════════════════════════════════════════════════════════════
 # STREAMLIT UI
@@ -662,14 +46,17 @@ with st.sidebar:
             
     pkg = st.text_input("Package name", value=st.session_state.pkg)
     st.session_state.pkg = pkg
-    target_fps = st.selectbox("🎯 Exact Game FPS (Target/Vsync)", [30, 45, 60, 90, 120, 144], index=2, help="Change this instantly to evaluate exact jank limits based on the game's actual FPS max.")
+    target_fps = 60
+    override_fps = False
+    duration = 10
+    
+    if mode == "🎬 Perfetto Session Recorder":
+        target_fps = st.selectbox("🎯 Exact Game FPS (Target/Vsync)", [30, 45, 60, 90, 120, 144], index=2, help="Change this instantly to evaluate exact jank limits based on the game's actual FPS max.")
+        override_fps = st.checkbox("Force Exact FPS (Override metrics if detection fails for this game)")
+        duration = st.slider("Recording duration (sec)", 5, 120, 10, help="For Perfetto traces, 10-20s is recommended to avoid gigantic trace files.")
+        
     st.session_state.target_fps = target_fps
-    
-    # Checkbox to override real_fps strictly
-    override_fps = st.checkbox("Force Exact FPS (Override metrics if detection fails for this game)")
     st.session_state.override_fps = override_fps
-    
-    duration = st.slider("Recording duration (sec)", 5, 120, 10, help="For Perfetto traces, 10-20s is recommended to avoid gigantic trace files.")
     poll_interval = 1.0
     st.divider()
     st.markdown("**📡 ADB Status**")
@@ -690,26 +77,109 @@ if mode == "📡 Real-Time Monitor":
             # For live mode, fake FPS to 0 since standard ADB fails for Unity/Native games
             live["fps_est"] = 0 
         
-        c1, c2, c3, c4 = st.columns(4)
-        c1.metric("🔋 Battery", f"{live.get('battery_pct', 'N/A')}%")
-        c2.metric("🌡️ Temp", f"{live.get('battery_temp', 'N/A')}°C")
-        c3.metric("⚡ Peak CPU", f"{live.get('cpu_pct', 0.0):.1f}%")
-        c4.metric("💾 RAM (PSS)", f"{live.get('mem_pss_mb', 0):.0f} MB" if live.get('mem_pss_mb') else "N/A")
+        # --- Foreground App Badge ---
+        fg_pkg = get_foreground_pkg()
+        if fg_pkg == pkg:
+            st.success(f"🟢 **ACTIVE:** [{pkg}]")
+        else:
+            st.error(f"🔴 **MINIMIZED/BACKGROUNDED:** [{fg_pkg or 'Unknown App'}]")
+
+        # 1 & 2. ALERTS and METRICS WITH DELTAS
+        prev_live = st.session_state.live_history[-1] if len(st.session_state.live_history) > 0 else live
         
-        live["time"] = datetime.now().strftime("%H:%M:%S")
+        def safe_diff(cur, prev):
+            try: return float(cur) - float(prev)
+            except: return 0.0
+            
+        dbatt = safe_diff(live.get('battery_pct'), prev_live.get('battery_pct'))
+        dtemp = safe_diff(live.get('battery_temp'), prev_live.get('battery_temp'))
+        dcpu = safe_diff(live.get('cpu_pct'), prev_live.get('cpu_pct'))
+        dmem = safe_diff(live.get('mem_pss_mb'), prev_live.get('mem_pss_mb'))
+
+        c1, c2, c3, c4 = st.columns(4)
+        c1.metric("🔋 Battery", f"{live.get('battery_pct', 'N/A')}%", delta=f"{dbatt:+.1f}%" if dbatt else None)
+        c2.metric("🌡️ Temp", f"{live.get('battery_temp', 'N/A')}°C", delta=f"{dtemp:+.1f}°C" if dtemp else None, delta_color="inverse")
+        c3.metric("⚡ Peak CPU", f"{live.get('cpu_pct', 0.0):.1f}%", delta=f"{dcpu:+.1f}%" if dcpu else None, delta_color="inverse")
+        
+        total_ram = live.get("total_ram_mb", 0)
+        pss = live.get("mem_pss_mb", 0)
+        
+        if pss and total_ram:
+            c4.metric("💾 RAM (PSS)", f"{pss:.0f} MB / {(total_ram/1024):.1f} GB")
+            live["mem_pct"] = (pss / total_ram) * 100
+        elif pss:
+            c4.metric("💾 RAM (PSS)", f"{pss:.0f} MB")
+            live["mem_pct"] = 0
+        else:
+            c4.metric("💾 RAM (PSS)", "N/A")
+            live["mem_pct"] = 0
+            
+        # --- Convert WiFi RSSI to 0-100% Signal Quality ---
+        dbm = live.get("wifi_rssi_dbm")
+        if dbm is not None:
+            # Typical representation: <= -100 dBm is 0%, >= -50 dBm is 100%
+            signal_pct = 2 * (dbm + 100)
+            live["wifi_signal_pct"] = max(0, min(100, signal_pct))
+        else:
+            live["wifi_signal_pct"] = 0
+        
+        _cpu_val = float(live.get('cpu_pct', 0)) if live.get('cpu_pct') else 0.0
+        _temp_val = float(live.get('battery_temp', 0)) if live.get('battery_temp') else 0.0
+        
+        # High CPU on multi-core can go up to 800%. Warning at 400% (4 cores maxed out).
+        if _cpu_val > 400:
+            st.warning(f"⚠️ **HIGH CPU:** Usage is heavily multi-threading ({_cpu_val}%). Keep an eye on battery drain.")
+        if _temp_val > 42:
+            st.error(f"⚠️ **CRITICAL:** Temperature exceeds 42°C ({_temp_val}°C)! Thermal throttling is highly likely.")
+        elif _temp_val > 39:
+            st.warning(f"⚠️ **WARNING:** Device is getting hot (> 39°C). Keep an eye on temperature.")
+
+        live["time"] = datetime.now().strftime("%M:%S")
         st.session_state.live_history.append(live)
         if len(st.session_state.live_history) > 60:
             st.session_state.live_history = st.session_state.live_history[-60:]
         
         if len(st.session_state.live_history) > 1:
             hist_df = pd.DataFrame(st.session_state.live_history)
-            fig_live = go.Figure()
+            
+            # --- Graph 1: CPU ---
+            fig_cpu = go.Figure()
             if "cpu_pct" in hist_df.columns:
-                fig_live.add_trace(go.Scatter(x=hist_df["time"], y=hist_df["cpu_pct"], name="CPU %", line={"color": "#3498db", "width": 2}, fill="tozeroy"))
+                fig_cpu.add_trace(go.Scatter(x=hist_df["time"], y=hist_df["cpu_pct"], name="CPU %", line={"color": "#3498db", "width": 2}, fill="tozeroy"))
+            # Auto-scale Y-axis for CPU because 8-core devices can hit 800%
+            fig_cpu.update_layout(title="CPU Utilization ", height=250, margin=dict(t=40, b=10, l=10, r=10), yaxis=dict(rangemode="tozero"))
+
+            # --- Graph 2: Temperature ---
+            fig_temp = go.Figure()
             if "battery_temp" in hist_df.columns:
-                fig_live.add_trace(go.Scatter(x=hist_df["time"], y=hist_df["battery_temp"], name="Batt Temp °C", line={"color": "#e74c3c", "width": 2}, yaxis="y2"))
-            fig_live.update_layout(title="Hardware Utilization", height=350, yaxis2=dict(overlaying="y", side="right"), legend=dict(x=0, y=1))
-            st.plotly_chart(fig_live, use_container_width=True)
+                fig_temp.add_trace(go.Scatter(x=hist_df["time"], y=hist_df["battery_temp"], name="Temp °C", line={"color": "#e74c3c", "width": 2}, fill="tozeroy"))
+            fig_temp.update_layout(title="Device Temperature (°C)", height=250, margin=dict(t=40, b=10, l=10, r=10), yaxis=dict(range=[20, 60]))
+            fig_temp.add_hline(y=42, line_dash="dash", line_color="red", annotation_text="Throttling Limit: 42°C")
+
+            # --- Graph 3: RAM (PSS) ---
+            fig_mem = go.Figure()
+            if "mem_pct" in hist_df.columns:
+                fig_mem.add_trace(go.Scatter(x=hist_df["time"], y=hist_df["mem_pct"], name="RAM %", line={"color": "#9b59b6", "width": 2}, fill="tozeroy"))
+            fig_mem.update_layout(title="RAM Leak Monitor (% of Total)", height=250, margin=dict(t=40, b=10, l=10, r=10), yaxis=dict(range=[0, 100]))
+
+            # --- Graph 4: Network (Signal %) ---
+            fig_net = go.Figure()
+            if "wifi_signal_pct" in hist_df.columns:
+                fig_net.add_trace(go.Scatter(x=hist_df["time"], y=hist_df["wifi_signal_pct"], name="WiFi Quality %", line={"color": "#f1c40f", "width": 2}, fill="tozeroy"))
+            fig_net.update_layout(title="Network Stability (Signal Quality %)", height=250, margin=dict(t=40, b=10, l=10, r=10), yaxis=dict(range=[0, 100]))
+
+            # --- Render in Grid Layout ---
+            row1_col1, row1_col2 = st.columns(2)
+            with row1_col1:
+                st.plotly_chart(fig_cpu, use_container_width=True)
+            with row1_col2:
+                st.plotly_chart(fig_temp, use_container_width=True)
+            
+            row2_col1, row2_col2 = st.columns(2)
+            with row2_col1:
+                st.plotly_chart(fig_mem, use_container_width=True)
+            with row2_col2:
+                st.plotly_chart(fig_net, use_container_width=True)
         
         time.sleep(poll_interval)
         st.rerun()
@@ -735,43 +205,47 @@ elif mode == "🎬 Perfetto Session Recorder":
         st.session_state["trace_method"] = ""
         st.session_state["trace_file"] = None
         
-        # 1. Start Perfetto as a background process so we don't need Streamlit threads
-        with st.spinner(f"🎥 Recording deeply on instrumented native graphics for {duration} seconds..."):
-            with open("perfetto_config.pbtx", "w") as f:
-                config = f'''buffers {{ size_kb: 65536 fill_policy: RING_BUFFER }} write_into_file: true file_write_period_ms: 2500 data_sources {{ config {{ name: "android.surfaceflinger.frametimeline" }} }} data_sources {{ config {{ name: "android.surfaceflinger" }} }} data_sources {{ config {{ name: "linux.ftrace" ftrace_config {{ ftrace_events: "ftrace/print" ftrace_events: "power/cpu_frequency" ftrace_events: "power/cpu_idle" atrace_categories: "gfx" atrace_categories: "view" atrace_categories: "wm" atrace_categories: "sched" atrace_categories: "freq" atrace_categories: "rs" atrace_categories: "am" atrace_apps: "{pkg}" atrace_apps: "*" }} }} }} data_sources {{ config {{ name: "linux.process_stats" process_stats_config {{ scan_all_processes_on_start: true proc_stats_poll_ms: 1000 }} }} }} duration_ms: {duration * 1000}'''
-                f.write(config)
-            subprocess.run("adb push perfetto_config.pbtx /data/local/tmp/perfetto_config.pbtx", shell=True)
-            
-            # Reset gfxinfo before recording
-            adb(f"dumpsys gfxinfo {pkg} reset")
-            
-            start_wall = time.time()
-            # Start perfetto asynchronously
-            perfetto_proc = subprocess.Popen("adb shell \"cat /data/local/tmp/perfetto_config.pbtx | perfetto --txt -c - -o /data/misc/perfetto-traces/trace.perfetto-trace\"", shell=True)
-            
-            # 2. Main thread stays alive to poll ADB hardware stats safely!
-            adb_results = []
-            end_time_limit = time.time() + duration
-            while time.time() < end_time_limit:
-                snap = collect_snapshot(pkg, datetime.now().isoformat())
-                adb_results.append(snap)
-                time.sleep(1.0)
-            
-            # Wait for perfetto to finish its graceful teardown
-            perfetto_proc.wait()
-            end_wall = time.time()
-            st.session_state["session_duration"] = end_wall - start_wall
-            
-            # Get final gfxinfo stats
-            st.session_state["gfx_summary"] = get_fps_mcp(pkg)
-            
-            # Give device an extra 2 seconds to flush trace to disk natively before pulling
-            time.sleep(2.0)
-            
-            # Pull trace
-            trace_file = f"trace_{pkg}_{int(time.time())}.perfetto-trace"
-            subprocess.run(f"adb pull /data/misc/perfetto-traces/trace.perfetto-trace {trace_file}", shell=True)
-            st.session_state["trace_file"] = trace_file
+        # 1. Push Perfetto config to device
+        with open("perfetto_config.pbtx", "w") as f:
+            config = f'''buffers {{ size_kb: 65536 fill_policy: RING_BUFFER }} write_into_file: true file_write_period_ms: 2500 data_sources {{ config {{ name: "android.surfaceflinger.frametimeline" }} }} data_sources {{ config {{ name: "android.surfaceflinger" }} }} data_sources {{ config {{ name: "linux.ftrace" ftrace_config {{ ftrace_events: "ftrace/print" ftrace_events: "power/cpu_frequency" ftrace_events: "power/cpu_idle" atrace_categories: "gfx" atrace_categories: "view" atrace_categories: "wm" atrace_categories: "sched" atrace_categories: "freq" atrace_categories: "rs" atrace_categories: "am" atrace_apps: "{pkg}" atrace_apps: "*" }} }} }} data_sources {{ config {{ name: "linux.process_stats" process_stats_config {{ scan_all_processes_on_start: true proc_stats_poll_ms: 1000 }} }} }} duration_ms: {duration * 1000}'''
+            f.write(config)
+        subprocess.run("adb push perfetto_config.pbtx /data/local/tmp/perfetto_config.pbtx", shell=True)
+        adb(f"dumpsys gfxinfo {pkg} reset")
+
+        # 2. Live countdown UI — replaces static spinner
+        _rec_header = st.empty()
+        _rec_progress = st.empty()
+        _rec_header.info(f"🎥 **Recording system trace for {duration}s** — Keep the game **actively playing** on the device!")
+
+        start_wall = time.time()
+        perfetto_proc = subprocess.Popen("adb shell \"cat /data/local/tmp/perfetto_config.pbtx | perfetto --txt -c - -o /data/misc/perfetto-traces/trace.perfetto-trace\"", shell=True)
+
+        # 3. Main thread polling + live progress bar
+        adb_results = []
+        end_time_limit = time.time() + duration
+        while time.time() < end_time_limit:
+            elapsed = time.time() - start_wall
+            remaining = max(0, int(duration - elapsed))
+            _rec_progress.progress(
+                min(elapsed / duration, 1.0),
+                text=f"⏱️ {int(elapsed)}s elapsed — ⏳ {remaining}s remaining | 📊 {len(adb_results)} snapshots captured"
+            )
+            snap = collect_snapshot(pkg, datetime.now().isoformat())
+            adb_results.append(snap)
+            time.sleep(1.0)
+
+        _rec_header.success("✅ Recording complete! Pulling trace from device...")
+        _rec_progress.empty()
+
+        # 4. Teardown & pull trace
+        perfetto_proc.wait()
+        end_wall = time.time()
+        st.session_state["session_duration"] = end_wall - start_wall
+        st.session_state["gfx_summary"] = get_fps_stats(pkg)
+        time.sleep(2.0)
+        trace_file = f"trace_{pkg}_{int(time.time())}.perfetto-trace"
+        subprocess.run(f"adb pull /data/misc/perfetto-traces/trace.perfetto-trace {trace_file}", shell=True)
+        st.session_state["trace_file"] = trace_file
 
         st.session_state.running = False
         st.session_state.data = adb_results
@@ -785,7 +259,10 @@ elif mode == "🎬 Perfetto Session Recorder":
                 st.success(f"✅ Perfetto processing complete! Method: `{method_used}`")
             else:
                 st.session_state.perfetto_data = "EMPTY"
-                st.warning("⚠️ No frame data found. Try: keep the game actively playing during recording.")
+                if "init_error" in method_used:
+                    st.error(f"Trace processing failed: {method_used}")
+                else:
+                    st.warning("⚠️ No frame data found. Try: keep the game actively playing during recording.")
 
     # ─── Dashboard Render ───────────────────
     if st.session_state.data and st.session_state.perfetto_data:
@@ -795,11 +272,36 @@ elif mode == "🎬 Perfetto Session Recorder":
         st.divider()
         st.subheader("📊 Session Summary")
         m1, m2, m3, m4, m5, m6 = st.columns(6)
-        
-        m1.metric("Batt Drain", f"{adb_df['battery_pct'].iloc[0] - adb_df['battery_pct'].iloc[-1]:.1f}%" if not adb_df['battery_pct'].isnull().all() else "N/A")
-        m2.metric("Max Temp", f"{adb_df['battery_temp'].max():.1f}°C" if not adb_df['battery_temp'].isnull().all() else "N/A")
-        m3.metric("Peak CPU", f"{adb_df['cpu_pct'].max():.1f}%" if not adb_df['cpu_pct'].isnull().all() else "N/A")
-        m4.metric("Avg RAM", f"{adb_df['mem_pss_mb'].mean():.0f}MB" if 'mem_pss_mb' in adb_df.columns and not adb_df['mem_pss_mb'].isnull().all() else "N/A")
+
+        # Fix 2: Sub-integer battery drain using voltage delta for precision
+        if not adb_df['battery_pct'].isnull().all():
+            int_drain = float(adb_df['battery_pct'].iloc[0] - adb_df['battery_pct'].iloc[-1])
+            if 'battery_volt' in adb_df.columns and not adb_df['battery_volt'].isnull().all():
+                volt_first = adb_df['battery_volt'].dropna().iloc[0]
+                volt_last  = adb_df['battery_volt'].dropna().iloc[-1]
+                volt_drop  = volt_first - volt_last
+                # LiPo range: 4.2V (100%) → 3.4V (0%) = 0.8V total → 0.008V per 1%
+                volt_drain_pct = volt_drop / 0.008
+                precise_drain = max(int_drain, round(volt_drain_pct, 4))
+            else:
+                precise_drain = int_drain
+            m1.metric("🔋 Batt Drain", f"{precise_drain:.4f}%")
+        else:
+            m1.metric("🔋 Batt Drain", "N/A")
+
+        m2.metric("🌡️ Max Temp", f"{adb_df['battery_temp'].max():.1f}°C" if not adb_df['battery_temp'].isnull().all() else "N/A")
+        m3.metric("⚡ Peak CPU", f"{adb_df['cpu_pct'].max():.1f}%" if not adb_df['cpu_pct'].isnull().all() else "N/A")
+
+        # Fix 3: Avg RAM with total device context
+        _avg_pss     = adb_df['mem_pss_mb'].mean() if 'mem_pss_mb' in adb_df.columns and not adb_df['mem_pss_mb'].isnull().all() else None
+        _total_ram_s = adb_df['total_ram_mb'].mean() if 'total_ram_mb' in adb_df.columns and not adb_df['total_ram_mb'].isnull().all() else None
+        if _avg_pss and _total_ram_s:
+            _ram_pct_s = (_avg_pss / _total_ram_s) * 100
+            m4.metric("💾 Avg RAM", f"{_avg_pss:.0f} MB / {(_total_ram_s / 1024):.1f} GB", delta=f"{_ram_pct_s:.1f}% of total", delta_color="off")
+        elif _avg_pss:
+            m4.metric("💾 Avg RAM", f"{_avg_pss:.0f} MB")
+        else:
+            m4.metric("💾 Avg RAM", "N/A")
 
         # ── FPS CALCULATION (Perfetto-first, gfxinfo as sanity check) ──
         gfx = st.session_state.get("gfx_summary", {})
@@ -843,7 +345,16 @@ elif mode == "🎬 Perfetto Session Recorder":
         _method = st.session_state.get("trace_method", "")
         _fps_label = "🎯 Real FPS" if _method.startswith("frametimeline") else "🎯 FPS (atrace)"
         m5.metric(_fps_label, f"{real_fps:.1f}")
-        m6.metric("⚠️ Jank %", f"{jank_pct:.1f}%")
+        # Fix 4: Jank % with color-coded health verdict
+        if jank_pct < 2:
+            _jank_verdict, _jank_color = "🟢 Excellent", "normal"
+        elif jank_pct < 5:
+            _jank_verdict, _jank_color = "🟡 Acceptable", "off"
+        elif jank_pct < 10:
+            _jank_verdict, _jank_color = "🟠 Warning", "inverse"
+        else:
+            _jank_verdict, _jank_color = "🔴 Critical", "inverse"
+        m6.metric("⚠️ Jank %", f"{jank_pct:.1f}%", delta=_jank_verdict, delta_color=_jank_color)
         
         with st.expander("🛠️ Advanced Debug: Trace Diagnostics"):
             if st.session_state.perfetto_data != "EMPTY":
@@ -923,13 +434,24 @@ elif mode == "🎬 Perfetto Session Recorder":
                 st.info("No latency data available for this trace.")
                 
         with t3:
-            fig2 = go.Figure()
-            if "cpu_pct" in adb_df.columns:
-                fig2.add_trace(go.Scatter(x=adb_df["time_s"], y=adb_df["cpu_pct"], name="CPU %", fill="tozeroy"))
-            if "mem_pss_mb" in adb_df.columns:
-                fig2.add_trace(go.Scatter(x=adb_df["time_s"], y=adb_df["mem_pss_mb"], name="RAM PSS", yaxis="y2"))
-            fig2.update_layout(yaxis2=dict(overlaying="y", side="right"), height=400)
-            st.plotly_chart(fig2, use_container_width=True)
+            # Fix 6: Split into clearly labelled side-by-side charts — no dual-Y confusion
+            hw_c1, hw_c2 = st.columns(2)
+            with hw_c1:
+                fig_cpu_s = go.Figure()
+                if "cpu_pct" in adb_df.columns:
+                    fig_cpu_s.add_trace(go.Scatter(x=adb_df["time_s"], y=adb_df["cpu_pct"], name="CPU %", line={"color": "#3498db", "width": 2}, fill="tozeroy"))
+                fig_cpu_s.update_layout(title="CPU Utilization (%)", height=350, margin=dict(t=40, b=10, l=10, r=10), yaxis=dict(rangemode="tozero", title="CPU %"))
+                st.plotly_chart(fig_cpu_s, use_container_width=True)
+            with hw_c2:
+                fig_ram_s = go.Figure()
+                if "mem_pss_mb" in adb_df.columns and "total_ram_mb" in adb_df.columns:
+                    adb_df["mem_pct_s"] = (adb_df["mem_pss_mb"] / adb_df["total_ram_mb"].replace(0, float("nan"))) * 100
+                    fig_ram_s.add_trace(go.Scatter(x=adb_df["time_s"], y=adb_df["mem_pct_s"], name="RAM %", line={"color": "#9b59b6", "width": 2}, fill="tozeroy"))
+                    fig_ram_s.update_layout(title="RAM Usage (% of Total)", height=350, margin=dict(t=40, b=10, l=10, r=10), yaxis=dict(range=[0, 100], title="RAM %"))
+                elif "mem_pss_mb" in adb_df.columns:
+                    fig_ram_s.add_trace(go.Scatter(x=adb_df["time_s"], y=adb_df["mem_pss_mb"], name="RAM (MB)", line={"color": "#9b59b6", "width": 2}, fill="tozeroy"))
+                    fig_ram_s.update_layout(title="RAM Usage (MB)", height=350, margin=dict(t=40, b=10, l=10, r=10), yaxis=dict(rangemode="tozero", title="MB"))
+                st.plotly_chart(fig_ram_s, use_container_width=True)
 
 # ══════════════════════════════════════════════════════════════
 # MODE 3: AI CHAT (MCP) — Real-Time Android Data Communication

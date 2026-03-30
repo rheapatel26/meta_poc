@@ -6,3 +6,4 @@ mcp
 adbutils
 python-dotenv
 openai
+perfetto
