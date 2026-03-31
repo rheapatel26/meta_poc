@@ -6,7 +6,7 @@ from perfetto.trace_processor import TraceProcessor
 def run_perfetto_trace(pkg, duration_sec):
     config = f"""
 buffers {{
-    size_kb: 65536
+    size_kb: 32768
     fill_policy: RING_BUFFER
 }}
 write_into_file: true
@@ -21,11 +21,6 @@ data_sources {{ config {{ name: "linux.ftrace"
             atrace_categories: "gfx"
             atrace_categories: "view"
             atrace_categories: "wm"
-            atrace_categories: "sched"
-            atrace_categories: "freq"
-            atrace_categories: "rs"
-            atrace_categories: "am"
-            atrace_apps: "{pkg}"
             atrace_apps: "*"
         }}
     }} }}
@@ -74,7 +69,7 @@ def parse_perfetto_trace(trace_path, pkg, target_fps=60):
                   COUNT(*) as c,
                   SUM(CASE WHEN layer_name LIKE '%{pkg}%' OR layer_name LIKE '%{short_pkg}%' THEN 1000 ELSE 0 END) as priority_score
                 FROM actual_frame_timeline_slice
-                WHERE present_type = 'PRESENTED'
+                WHERE present_type LIKE '%Present%'
                   AND (
                     layer_name IS NULL
                     OR (
@@ -103,7 +98,7 @@ def parse_perfetto_trace(trace_path, pkg, target_fps=60):
                 WITH app_frames AS (
                   SELECT ts, dur
                   FROM actual_frame_timeline_slice
-                  WHERE present_type = 'PRESENTED'
+                  WHERE present_type LIKE '%Present%'
                     AND {layer_filter}
                 ),
                 min_ts AS (SELECT MIN(ts) as start_ts FROM app_frames),

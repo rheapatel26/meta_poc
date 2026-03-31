@@ -7,3 +7,4 @@ adbutils
 python-dotenv
 openai
 perfetto
+nest_asyncio
