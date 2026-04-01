@@ -7,6 +7,7 @@ import plotly.express as px
 import subprocess, time, re, os, json
 from datetime import datetime
 
+
 # ─── ADB helpers ──────────────────────────────────────────────
 def adb(cmd):
     try:
@@ -18,16 +19,18 @@ def adb(cmd):
     except Exception:
         return ""
 
+
 def get_battery():
     raw = adb("dumpsys battery")
     level = re.search(r"level: (\d+)", raw)
-    temp  = re.search(r"temperature: (\d+)", raw)
-    volt  = re.search(r"voltage: (\d+)", raw)
+    temp = re.search(r"temperature: (\d+)", raw)
+    volt = re.search(r"voltage: (\d+)", raw)
     return {
-        "battery_pct":  int(level.group(1)) if level else None,
+        "battery_pct": int(level.group(1)) if level else None,
         "battery_temp": int(temp.group(1)) / 10 if temp else None,
         "battery_volt": int(volt.group(1)) / 1000 if volt else None,
     }
+
 
 def get_memory(pkg):
     raw = adb(f"dumpsys meminfo {pkg}")
@@ -38,10 +41,12 @@ def get_memory(pkg):
         "mem_rss_mb": int(rss.group(1)) / 1024 if rss else None,
     }
 
+
 def get_cpu(pkg):
     raw = adb("dumpsys cpuinfo")
     match = re.search(rf"([\d.]+)% .+{re.escape(pkg)}", raw)
     return {"cpu_pct": float(match.group(1)) if match else 0.0}
+
 
 def get_fps(pkg):
     layer_name = None
@@ -84,14 +89,14 @@ def get_fps(pkg):
                             valid.append(actual)
                     except:
                         pass
-        
+
         if len(valid) > 1:
             diff_ns = valid[-1] - valid[0]
             if diff_ns > 0:
                 fps_est = float(f"{(len(valid) - 1) * 1e9 / diff_ns:.1f}")
             total = len(valid)
             for i in range(1, len(valid)):
-                if valid[i] - valid[i-1] > janky_threshold:
+                if valid[i] - valid[i - 1] > janky_threshold:
                     janky += 1
 
     if total == 0:
@@ -100,26 +105,30 @@ def get_fps(pkg):
         flip1 = None
         match1 = re.search(r"Result: Parcel\([\w]+\s+([\w]+)", raw_flip1)
         if match1:
-            try: flip1 = int(match1.group(1), 16)
-            except: pass
-            
+            try:
+                flip1 = int(match1.group(1), 16)
+            except:
+                pass
+
         time.sleep(0.5)
-        
+
         raw_flip2 = adb("service call SurfaceFlinger 1013")
         flip2 = None
         match2 = re.search(r"Result: Parcel\([\w]+\s+([\w]+)", raw_flip2)
         if match2:
-            try: flip2 = int(match2.group(1), 16)
-            except: pass
+            try:
+                flip2 = int(match2.group(1), 16)
+            except:
+                pass
 
         raw = adb(f"dumpsys gfxinfo {pkg} framestats")
         j_match = re.search(r"Janky frames: (\d+)", raw)
         t_match = re.search(r"Total frames rendered: (\d+)", raw)
         lines = [l for l in raw.splitlines() if l.count(',') >= 13]
-        
+
         janky = int(j_match.group(1)) if j_match else 0
         total = int(t_match.group(1)) if t_match else 0
-        
+
         if lines:
             try:
                 intervals = []
@@ -139,7 +148,7 @@ def get_fps(pkg):
                         fps_est = float(f"{1e9 / avg_ns:.1f}")
             except:
                 pass
-                
+
         if fps_est == 0.0 and flip1 is not None and flip2 is not None:
             if flip2 >= flip1:
                 fps_est = float((flip2 - flip1) * 2)
@@ -152,15 +161,18 @@ def get_fps(pkg):
         "fps_est": fps_est,
     }
 
+
 def get_thermals():
     raw = adb('"cat /sys/class/thermal/thermal_zone*/temp 2>/dev/null"')
-    temps = [int(t)/1000 for t in raw.split() if t.isdigit() and int(t) < 200000]
+    temps = [int(t) / 1000 for t in raw.split() if t.isdigit() and int(t) < 200000]
     return {"max_thermal_c": max(temps) if temps else None}
+
 
 def get_foreground_pkg():
     raw = adb('"dumpsys activity | grep mResumedActivity"')
     match = re.search(r"u0 ([\w.]+)/", raw)
     return match.group(1) if match else None
+
 
 def collect_snapshot(pkg, ts):
     row = {"timestamp": ts}
@@ -171,6 +183,7 @@ def collect_snapshot(pkg, ts):
     row.update(get_thermals())
     return row
 
+
 def collect_quick_snapshot(pkg):
     """Lighter snapshot for real-time view."""
     row = {}
@@ -180,6 +193,7 @@ def collect_quick_snapshot(pkg):
     row.update(get_fps(pkg))
     row.update(get_thermals())
     return row
+
 
 # ─── MCP-style AI Tool Router ────────────────────────────────
 # This simulates what an MCP client does: maps natural language
@@ -192,10 +206,11 @@ def get_device_health():
     screen_raw = adb('"dumpsys display | grep mScreenState"')
     temp_val = temp_raw.split()[-1] if temp_raw.strip() else "0"
     return {
-        "temp": f"{int(temp_val)/10}°C" if temp_val.isdigit() else "N/A",
+        "temp": f"{int(temp_val) / 10}°C" if temp_val.isdigit() else "N/A",
         "cpu": cpu_raw.strip()[:80] if cpu_raw.strip() else "Idle",
         "status": "Active" if "ON" in screen_raw.upper() else "Frozen/Off"
     }
+
 
 def get_device_fps_mcp(package_name):
     """MCP Tool: Returns janky and total frames for a package."""
@@ -209,38 +224,40 @@ def get_device_fps_mcp(package_name):
         "total_frames": int(total.group(1)) if total else 0,
     }
 
+
 AVAILABLE_TOOLS = {
     "get_device_health": {
         "function": get_device_health,
         "description": "Returns device thermal temp, CPU load, and screen status.",
-        "keywords": ["health", "temperature", "temp", "thermal", "screen", "status", 
-                      "cpu", "device", "hot", "heating", "alive", "on", "off", "frozen"],
+        "keywords": ["health", "temperature", "temp", "thermal", "screen", "status",
+                     "cpu", "device", "hot", "heating", "alive", "on", "off", "frozen"],
         "needs_pkg": False,
     },
     "get_device_fps": {
         "function": get_device_fps_mcp,
         "description": "Returns janky and total frames rendered for a specific game package.",
-        "keywords": ["fps", "frames", "janky", "stutter", "lag", "performance", 
-                      "smooth", "frame", "render", "jank", "drop"],
+        "keywords": ["fps", "frames", "janky", "stutter", "lag", "performance",
+                     "smooth", "frame", "render", "jank", "drop"],
         "needs_pkg": True,
     },
 }
 
+
 def route_query(query, pkg):
     """Simulates MCP routing: figures out which tool to call based on the query."""
     query_lower = query.lower()
-    
+
     # Check if user wants both/all
     wants_all = any(w in query_lower for w in ["everything", "all", "full", "complete", "summary", "overview"])
-    
+
     matched_tools = []
     for tool_name, tool_info in AVAILABLE_TOOLS.items():
         if any(kw in query_lower for kw in tool_info["keywords"]):
             matched_tools.append(tool_name)
-    
+
     if wants_all or len(matched_tools) == 0:
         matched_tools = list(AVAILABLE_TOOLS.keys())
-    
+
     results = {}
     tools_called = []
     for tool_name in matched_tools:
@@ -250,15 +267,16 @@ def route_query(query, pkg):
             results[tool_name] = tool["function"](pkg)
         else:
             results[tool_name] = tool["function"]()
-    
+
     return results, tools_called
+
 
 def format_ai_response(results, tools_called):
     """Formats tool results into a friendly AI-style response."""
     parts = []
     parts.append("🤖 **AI Device Monitor Response**\n")
     parts.append(f"*Tools executed:* `{'`, `'.join(tools_called)}`\n")
-    
+
     if "get_device_health" in results:
         h = results["get_device_health"]
         parts.append("---")
@@ -266,10 +284,10 @@ def format_ai_response(results, tools_called):
         parts.append(f"- **Temperature:** {h['temp']}")
         parts.append(f"- **Screen:** {h['status']}")
         parts.append(f"- **CPU:** {h['cpu']}")
-        
+
         if "Frozen" in h["status"] or "Off" in h["status"]:
             parts.append("\n⚠️ *Warning: The device screen appears to be off or frozen!*")
-    
+
     if "get_device_fps" in results:
         f = results["get_device_fps"]
         parts.append("---")
@@ -277,7 +295,7 @@ def format_ai_response(results, tools_called):
         parts.append(f"- **Package:** `{f['package']}`")
         parts.append(f"- **Total Frames Rendered:** {f['total_frames']}")
         parts.append(f"- **Janky Frames:** {f['janky_frames']}")
-        
+
         if f["total_frames"] > 0 and f["janky_frames"] > 0:
             jank_pct = (f["janky_frames"] / f["total_frames"]) * 100
             parts.append(f"- **Jank Rate:** {jank_pct:.1f}%")
@@ -287,11 +305,11 @@ def format_ai_response(results, tools_called):
                 parts.append(f"\n✅ *Jank rate is acceptable ({jank_pct:.1f}%). Game should feel smooth.*")
         elif f["total_frames"] == 0:
             parts.append("\n⚠️ *No frames detected. Is the game actively running on the device screen?*")
-    
+
     parts.append("---")
     parts.append("*Raw JSON output:*")
     parts.append(f"```json\n{json.dumps(results, indent=2)}\n```")
-    
+
     return "\n".join(parts)
 
 
@@ -314,16 +332,16 @@ for key, default in defaults.items():
 # ─── Sidebar controls ────────────────────────────────────────
 with st.sidebar:
     st.header("⚙️ Configuration")
-    
+
     # Mode selector (replaces tabs to avoid rerun conflicts)
-    mode = st.radio("📌 Select Mode", 
+    mode = st.radio("📌 Select Mode",
                     ["📡 Real-Time Monitor", "🎬 Session Recorder", "🤖 AI Chat (MCP)"],
                     index=0)
-    
+
     st.divider()
-    
+
     auto_detect = st.toggle("Auto-detect game", value=False)
-    
+
     if auto_detect:
         if st.button("🔍 Detect foreground app"):
             detected = get_foreground_pkg()
@@ -337,13 +355,12 @@ with st.sidebar:
 
     duration = st.slider("Recording duration (sec)", 10, 120, 60)
     poll_interval = st.selectbox("Poll interval (sec)", [0.5, 1, 2], index=1)
-    
+
     st.divider()
     st.markdown("**📡 ADB Status**")
     if st.button("Check ADB connection"):
         out = subprocess.run("adb devices", shell=True, capture_output=True, text=True)
         st.code(out.stdout)
-
 
 # ══════════════════════════════════════════════════════════════
 # MODE 1: REAL-TIME LIVE MONITOR
@@ -354,27 +371,27 @@ if mode == "📡 Real-Time Monitor":
         st.warning("⚠️ Enter a package name in the sidebar first!")
     else:
         st.info(f"Monitoring **{pkg}** — auto-refreshing every **{poll_interval}s**")
-        
+
         with st.spinner("Polling device..."):
             live = collect_quick_snapshot(pkg)
-        
+
         # Live KPI Cards
         c1, c2, c3, c4, c5, c6 = st.columns(6)
-        
+
         batt_pct = live.get("battery_pct")
         batt_temp = live.get("battery_temp")
         cpu_pct = live.get("cpu_pct", 0.0)
         mem_pss = live.get("mem_pss_mb")
         fps = live.get("fps_est", 0.0)
         thermal = live.get("max_thermal_c")
-        
+
         c1.metric("🔋 Battery", f"{batt_pct}%" if batt_pct is not None else "N/A")
         c2.metric("🌡️ Batt Temp", f"{batt_temp:.1f}°C" if batt_temp is not None else "N/A")
         c3.metric("⚡ CPU", f"{cpu_pct:.1f}%")
         c4.metric("💾 RAM (PSS)", f"{mem_pss:.0f} MB" if mem_pss is not None else "N/A")
         c5.metric("🎞️ FPS", f"{fps:.1f}")
         c6.metric("🔥 Max Thermal", f"{thermal:.1f}°C" if thermal is not None else "N/A")
-        
+
         janky = live.get("janky_frames", 0)
         total_frames = live.get("total_frames", 0)
         if janky > 0:
@@ -385,22 +402,22 @@ if mode == "📡 Real-Time Monitor":
             st.error("⚠️ ALERT: Device Screen is Inactive!")
         else:
             st.success("✅ Device Screen is ON")
-        
+
         # Append to rolling history
         live["time"] = datetime.now().strftime("%H:%M:%S")
         st.session_state.live_history.append(live)
         if len(st.session_state.live_history) > 60:
             st.session_state.live_history = st.session_state.live_history[-60:]
-        
+
         # Rolling Charts
         if len(st.session_state.live_history) > 1:
             hist_df = pd.DataFrame(st.session_state.live_history)
-            
+
             st.divider()
             st.markdown("##### 📈 Rolling History (last 60 polls)")
-            
+
             lt1, lt2 = st.columns(2)
-            
+
             with lt1:
                 fig_live1 = go.Figure()
                 if "fps_est" in hist_df.columns:
@@ -417,7 +434,7 @@ if mode == "📡 Real-Time Monitor":
                     xaxis_title="Time", yaxis_title="Value",
                     legend=dict(x=0, y=1))
                 st.plotly_chart(fig_live1, use_container_width=True)
-            
+
             with lt2:
                 fig_live2 = go.Figure()
                 if "battery_temp" in hist_df.columns:
@@ -439,7 +456,7 @@ if mode == "📡 Real-Time Monitor":
                     yaxis2=dict(overlaying="y", side="right", title="MB"),
                     legend=dict(x=0, y=1))
                 st.plotly_chart(fig_live2, use_container_width=True)
-        
+
         # Auto-refresh (only in live mode)
         time.sleep(poll_interval)
         st.rerun()
@@ -454,7 +471,7 @@ elif mode == "🎬 Session Recorder":
         st.warning("⚠️ Enter a package name in the sidebar first!")
     else:
         st.info(f"Record **{int(duration)}s** of performance data for **{pkg}** at **{poll_interval}s** intervals.")
-        
+
         # Controls
         rc1, rc2, _ = st.columns([2, 2, 4])
         with rc1:
@@ -468,15 +485,15 @@ elif mode == "🎬 Session Recorder":
             st.session_state.data = []
             progress = st.progress(0, text="Starting capture...")
             status = st.empty()
-            
+
             num_samples = int(duration / poll_interval)
             for i in range(num_samples):
                 snap = collect_snapshot(pkg, datetime.now().isoformat())
                 st.session_state.data.append(snap)
                 pct = (i + 1) / num_samples
-                progress.progress(pct, text=f"Capturing... {i+1}/{num_samples} samples")
+                progress.progress(pct, text=f"Capturing... {i + 1}/{num_samples} samples")
                 time.sleep(poll_interval)
-            
+
             st.session_state.running = False
             df = pd.DataFrame(st.session_state.data)
             fname = f"game_profile_{pkg}_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv"
@@ -488,10 +505,10 @@ elif mode == "🎬 Session Recorder":
         if st.session_state.data:
             df = pd.DataFrame(st.session_state.data)
             df["time_s"] = range(len(df))
-            
+
             st.divider()
             st.subheader("📊 Session Summary")
-            
+
             m1, m2, m3, m4, m5, m6 = st.columns(6)
             m1.metric("Avg Battery %", f"{df['battery_pct'].mean():.1f}%",
                       f"{df['battery_pct'].iloc[-1] - df['battery_pct'].iloc[0]:+.0f}% drain")
@@ -505,40 +522,40 @@ elif mode == "🎬 Session Recorder":
                       f"avg {df['max_thermal_c'].mean():.1f}°")
             m6.metric("Avg FPS", f"{df['fps_est'].mean():.1f}",
                       f"peak {df['fps_est'].max():.1f}")
-            
+
             tab1, tab2, tab3 = st.tabs(["🔋 Battery & Temp", "⚡ CPU & RAM", "🎞 FPS & Frames"])
-            
+
             with tab1:
                 fig = go.Figure()
                 fig.add_trace(go.Scatter(x=df["time_s"], y=df["battery_pct"],
-                                          name="Battery %", line={"color": "#2ecc71", "width": 2}))
+                                         name="Battery %", line={"color": "#2ecc71", "width": 2}))
                 fig.add_trace(go.Scatter(x=df["time_s"], y=df["battery_temp"],
-                                          name="Temp (°C)", line={"color": "#e74c3c", "width": 2},
-                                          yaxis="y2"))
+                                         name="Temp (°C)", line={"color": "#e74c3c", "width": 2},
+                                         yaxis="y2"))
                 fig.update_layout(yaxis2=dict(overlaying="y", side="right", title="Temp °C"),
                                   xaxis_title="Time (s)", yaxis_title="Battery %",
                                   legend=dict(x=0, y=1), height=360)
                 st.plotly_chart(fig, use_container_width=True)
-            
+
             with tab2:
                 fig2 = go.Figure()
                 fig2.add_trace(go.Scatter(x=df["time_s"], y=df["cpu_pct"],
-                                           name="CPU %", fill="tozeroy", line={"color": "#3498db"}))
+                                          name="CPU %", fill="tozeroy", line={"color": "#3498db"}))
                 fig2.add_trace(go.Scatter(x=df["time_s"], y=df["mem_pss_mb"],
-                                           name="RAM PSS (MB)", line={"color": "#9b59b6"},
-                                           yaxis="y2"))
+                                          name="RAM PSS (MB)", line={"color": "#9b59b6"},
+                                          yaxis="y2"))
                 fig2.update_layout(yaxis2=dict(overlaying="y", side="right", title="MB"),
                                    xaxis_title="Time (s)", yaxis_title="CPU %", height=360)
                 st.plotly_chart(fig2, use_container_width=True)
-            
+
             with tab3:
                 if "janky_frames" in df.columns and "fps_est" in df.columns:
                     fig3 = go.Figure()
                     fig3.add_trace(go.Scatter(x=df["time_s"], y=df["fps_est"],
-                                               name="FPS", line={"color": "#f1c40f", "width": 2}))
+                                              name="FPS", line={"color": "#f1c40f", "width": 2}))
                     fig3.add_trace(go.Bar(x=df["time_s"], y=df["janky_frames"],
-                                           name="Janky Frames", marker_color="#e74c3c", opacity=0.6,
-                                           yaxis="y2"))
+                                          name="Janky Frames", marker_color="#e74c3c", opacity=0.6,
+                                          yaxis="y2"))
                     fig3.update_layout(yaxis2=dict(overlaying="y", side="right", title="Janky Frames"),
                                        xaxis_title="Time (s)", yaxis_title="FPS",
                                        legend=dict(x=0, y=1), height=360)
@@ -550,7 +567,7 @@ elif mode == "🎬 Session Recorder":
                     st.plotly_chart(fig3, use_container_width=True)
                 else:
                     st.info("GFX info not available for this package.")
-            
+
             if st.session_state.log_path and os.path.exists(st.session_state.log_path):
                 with open(st.session_state.log_path, "rb") as f:
                     st.download_button("⬇ Download CSV log", f,
@@ -574,36 +591,36 @@ elif mode == "🤖 AI Chat (MCP)":
     - *"Is the screen on?"*
     - *"Give me everything"*
     """)
-    
+
     st.divider()
-    
+
     # Show available tools
     with st.expander("🔧 Available MCP Tools"):
         for name, info in AVAILABLE_TOOLS.items():
             st.markdown(f"**`{name}`** — {info['description']}")
             st.caption(f"Trigger keywords: {', '.join(info['keywords'][:6])}...")
-    
+
     # Chat history display
     for msg in st.session_state.chat_messages:
         with st.chat_message(msg["role"]):
             st.markdown(msg["content"])
-    
+
     # Chat input
     if prompt := st.chat_input("Ask about your device... (e.g. 'check fps', 'device health', 'give me everything')"):
         # Show user message
         st.session_state.chat_messages.append({"role": "user", "content": prompt})
         with st.chat_message("user"):
             st.markdown(prompt)
-        
+
         # Process query through MCP tool router
         with st.chat_message("assistant"):
             with st.spinner("🔍 Routing query to MCP tools & polling device via ADB..."):
                 results, tools_called = route_query(prompt, pkg)
                 response = format_ai_response(results, tools_called)
             st.markdown(response)
-        
+
         st.session_state.chat_messages.append({"role": "assistant", "content": response})
-    
+
     # Clear chat button
     if st.session_state.chat_messages:
         if st.button("🗑️ Clear Chat"):
