@@ -1,12 +1,13 @@
-import streamlit as st
-import pandas as pd
+import re
 import subprocess
 import time
-import re
+
+import streamlit as st
 from mcp.server.fastmcp import FastMCP
 
 # 1. Setup MCP for the AI
 mcp = FastMCP("Device-Monitor")
+
 
 def get_adb_stat(cmd_args):
     # Running adb commands. cmd_args is a list of arguments.
@@ -15,6 +16,7 @@ def get_adb_stat(cmd_args):
     cmd_str = " ".join(["adb"] + cmd_args)
     result = subprocess.run(cmd_str, capture_output=True, text=True, shell=True)
     return result.stdout.strip()
+
 
 @mcp.tool()
 def get_device_health():
@@ -29,10 +31,11 @@ def get_device_health():
     temp_val = temp_raw.split()[-1] if temp_raw else "0"
 
     return {
-        "temp": f"{int(temp_val)/10}°C" if temp_val.isdigit() else "N/A",
+        "temp": f"{int(temp_val) / 10}°C" if temp_val.isdigit() else "N/A",
         "cpu": cpu if cpu else "Idle",
         "status": "Active" if "ON" in screen.upper() else "Frozen/Off"
     }
+
 
 @mcp.tool()
 def get_device_fps(package_name: str):
@@ -41,12 +44,13 @@ def get_device_fps(package_name: str):
     raw = get_adb_stat(["shell", "dumpsys", "gfxinfo", package_name])
     janky = re.search(r"Janky frames: (\d+)", raw)
     total = re.search(r"Total frames rendered: (\d+)", raw)
-    
+
     return {
         "package": package_name,
         "janky_frames": int(janky.group(1)) if janky else 0,
         "total_frames": int(total.group(1)) if total else 0,
     }
+
 
 # 2. Setup Streamlit Dashboard UI
 if __name__ == "__main__":
@@ -73,10 +77,11 @@ if __name__ == "__main__":
                 # Truncate CPU text for better metric display or use info block
                 st.info(f"CPU Load: {stats['cpu'].strip()[:50]}")
             with col4:
-                st.metric("FPS / Frames", fps_stats['total_frames'], f"-{fps_stats['janky_frames']} janky", delta_color="inverse")
+                st.metric("FPS / Frames", fps_stats['total_frames'], f"-{fps_stats['janky_frames']} janky",
+                          delta_color="inverse")
 
             # Simple "Frozen" detection logic
             if "OFF" in stats['status'].upper():
                 st.error("⚠️ ALERT: Device Screen is Inactive!")
 
-        time.sleep(2) # Refresh every 2 seconds
+        time.sleep(2)  # Refresh every 2 seconds

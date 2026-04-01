@@ -1,0 +1,135 @@
+# =========================
+# Python basics
+# =========================
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+
+# =========================
+# Virtual environments
+# =========================
+venv/
+env/
+.venv/
+ENV/
+.python-version
+
+# =========================
+# Packaging / build
+# =========================
+build/
+dist/
+.eggs/
+*.egg-info/
+*.egg
+
+# =========================
+# Logs
+# =========================
+*.log
+logs/
+
+# =========================
+# Environment variables
+# =========================
+.env
+.env.*
+*.env
+
+# =========================
+# IDE / OS
+# =========================
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+*.swp
+*~
+
+# =========================
+# Streamlit
+# =========================
+.streamlit/secrets.toml
+.streamlit/credentials.toml
+
+# =========================
+# Data (pandas)
+# =========================
+data/
+datasets/
+*.csv
+*.tsv
+*.xlsx
+*.parquet
+*.feather
+*.jsonl
+
+# =========================
+# Plot exports
+# =========================
+*.html
+*.png
+*.jpg
+*.jpeg
+*.svg
+
+# =========================
+# MCP / sensitive configs
+# =========================
+mcp_config.json
+secrets.json
+credentials.json
+*.key
+*.pem
+
+# =========================
+# ADB / Android artifacts
+# =========================
+*.apk
+*.apks
+*.obb
+adb_logs/
+device_logs/
+screenshots/
+recordings/
+*.mp4
+*.avi
+
+# =========================
+# Cache / temp
+# =========================
+.cache/
+.tmp/
+temp/
+*.tmp
+
+# =========================
+# Jupyter
+# =========================
+.ipynb_checkpoints/
+
+# =========================
+# Testing
+# =========================
+.pytest_cache/
+.coverage
+.coverage.*
+htmlcov/
+
+# =========================
+# Docker (NEW)
+# =========================
+docker-compose.override.yml
+*.tar
+*.tar.gz
+*.img
+
+# Ignore local docker env overrides
+.env.docker
+
+# =========================
+# Misc
+# =========================
+*.bak
+*.old
