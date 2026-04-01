@@ -1,119 +1,135 @@
-# Byte-compiled / optimized / DLL files
+# =========================
+# Python basics
+# =========================
 __pycache__/
 *.py[cod]
 *$py.class
-
-# C extensions
 *.so
 
-# Distribution / packaging
-.Python
-build/
-develop-eggs/
-dist/
-downloads/
-eggs/
-.eggs/
-lib/
-lib64/
-parts/
-sdist/
-var/
-*.egg-info/
-.installed.cfg
-*.egg
-
+# =========================
 # Virtual environments
+# =========================
 venv/
 env/
-ENV/
 .venv/
+ENV/
 .python-version
 
-# Pip / Poetry / Pipenv
-pip-log.txt
-pip-delete-this-directory.txt
-poetry.lock
-Pipfile.lock
+# =========================
+# Packaging / build
+# =========================
+build/
+dist/
+.eggs/
+*.egg-info/
+*.egg
 
-# Unit test / coverage reports
-htmlcov/
-.tox/
-.nox/
-.coverage
-.coverage.*
-.cache
-pytest_cache/
-nosetests.xml
-coverage.xml
-*.cover
-*.py,cover
-
-# Jupyter Notebook
-.ipynb_checkpoints
-
+# =========================
 # Logs
+# =========================
 *.log
 logs/
 
+# =========================
 # Environment variables
+# =========================
 .env
 .env.*
 *.env
 
-# IDEs / Editors
+# =========================
+# IDE / OS
+# =========================
 .vscode/
 .idea/
-*.swp
-*.swo
-*~
-
-# OS files
 .DS_Store
 Thumbs.db
+*.swp
+*~
 
-# AI / ML specific
-models/
-checkpoints/
-*.ckpt
-*.pt
-*.pth
-*.onnx
-*.h5
+# =========================
+# Streamlit
+# =========================
+.streamlit/secrets.toml
+.streamlit/credentials.toml
 
-# Large datasets
+# =========================
+# Data (pandas)
+# =========================
 data/
 datasets/
 *.csv
 *.tsv
-*.jsonl
+*.xlsx
 *.parquet
+*.feather
+*.jsonl
 
-# Experiment tracking
-mlruns/
-wandb/
-tensorboard/
-runs/
+# =========================
+# Plot exports
+# =========================
+*.html
+*.png
+*.jpg
+*.jpeg
+*.svg
 
-# Cache directories
-.cache/
-.tmp/
-temp/
-
-# MCP / API configs (sensitive)
+# =========================
+# MCP / sensitive configs
+# =========================
 mcp_config.json
 secrets.json
 credentials.json
+*.key
+*.pem
 
-# Docker
-*.pid
-*.seed
-*.pid.lock
+# =========================
+# ADB / Android artifacts
+# =========================
+*.apk
+*.apks
+*.obb
+adb_logs/
+device_logs/
+screenshots/
+recordings/
+*.mp4
+*.avi
 
-# Build artifacts
-*.out
-*.err
-
-# Misc
-*.bak
+# =========================
+# Cache / temp
+# =========================
+.cache/
+.tmp/
+temp/
 *.tmp
+
+# =========================
+# Jupyter
+# =========================
+.ipynb_checkpoints/
+
+# =========================
+# Testing
+# =========================
+.pytest_cache/
+.coverage
+.coverage.*
+htmlcov/
+
+# =========================
+# Docker (NEW)
+# =========================
+docker-compose.override.yml
+*.tar
+*.tar.gz
+*.img
+
+# Ignore local docker env overrides
+.env.docker
+
+# =========================
+# Misc
+# =========================
+*.bak
+*.old
