@@ -1,8 +1,8 @@
-import streamlit as st
-import pandas as pd
+import re
 import subprocess
 import time
-import re
+
+import streamlit as st
 from mcp.server.fastmcp import FastMCP
 
 # 1. Setup MCP for the AI

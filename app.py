@@ -1,11 +1,16 @@
 # app.py — Unified Android Game Profiler
 # Real-time live monitor + 60s session recorder + MCP AI Chat in one Streamlit app
-import streamlit as st
-import pandas as pd
-import plotly.graph_objects as go
-import plotly.express as px
-import subprocess, time, re, os, json
+import json
+import os
+import re
+import subprocess
+import time
 from datetime import datetime
+
+import pandas as pd
+import plotly.express as px
+import plotly.graph_objects as go
+import streamlit as st
 
 
 # ─── ADB helpers ──────────────────────────────────────────────
